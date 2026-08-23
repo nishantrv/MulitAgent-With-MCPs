@@ -10,7 +10,7 @@ os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 from typing import TypedDict, Annotated
 import operator
 import uuid
-
+import asyncio
 import psycopg
 from psycopg.rows import dict_row
 
@@ -23,8 +23,9 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_groq import ChatGroq
-from tools.tavily_tool import tavily_search
-from tools.flight_tool import search_flights
+# from tools.tavily_tool import tavily_search
+# from tools.flight_tool import search_flights
+from mcp_client import tavily_mcp_search, aviation_mcp_call, extract_destination, forecast_mcp_search, weather_mcp_search
 
 
 def get_database_url():
@@ -52,8 +53,10 @@ if not GROQ_API_KEY:
 # =========================
 
 llm = ChatGroq(
-    model="groq/compound-mini",
-    api_key=GROQ_API_KEY
+    model="openai/gpt-oss-20b",
+    api_key=GROQ_API_KEY,
+    temperature=0.3,
+    max_tokens=1200
 )
 
 
@@ -68,35 +71,94 @@ class TravelState(TypedDict):
     hotel_results: str
     itinerary: str
     llm_calls: int
-
-
-# =========================
-# Helper function to truncate results
-# =========================
-def truncate_results(text: str, max_chars: int = 1500) -> str:
-    """Truncate results to avoid API payload limits."""
-    if len(text) > max_chars:
-        return text[:max_chars] + "...\n(Results truncated for brevity)"
-    return text
+    weather_results: str
 
 
 # =========================
 # Flight Agent
 # =========================
 
+
+# Flight Tool Router Prompt
+FLIGHT_AGENT_PROMPT = """
+You are a travel flight expert.
+
+User Query:
+{query}
+
+Airport Information:
+{airport_data}
+
+Airline Information:
+{airline_data}
+
+Generate:
+
+1. Likely departure airport
+2. Likely arrival airport
+3. Airlines serving this route
+4. Typical flight duration
+5. Estimated airfare range
+6. Peak season pricing warning
+7. Booking advice
+
+Return concise travel guidance.
+"""
+
+# Flight Agent
 def flight_agent(state: TravelState):
+    print("\nINSIDE FLIGHT AGENT\n")
+
     query = state["user_query"]
-    flight_data = search_flights(query)
-    # Truncate to 1500 chars to reduce payload
-    flight_data = truncate_results(flight_data, max_chars=1500)
+
+    try:
+
+        airports = asyncio.run(
+            aviation_mcp_call(
+                "list_airports"
+            )
+        )
+
+        airlines = asyncio.run(
+            aviation_mcp_call(
+                "list_airlines"
+            )
+        )
+
+
+        print("\nAIRPORTS:", airports)
+        print("\nAIRLINES:", airlines)
+
+        prompt = FLIGHT_AGENT_PROMPT.format(
+            query=query,
+            airport_data=str(airports)[:3000],
+            airline_data=str(airlines)[:3000]
+        )
+
+        response = llm.invoke([
+            SystemMessage(
+                content="You are an expert travel flight planner."
+            ),
+            HumanMessage(content=prompt)
+        ])
+
+        flight_data = response.content
+
+    except Exception as e:
+
+        flight_data = f"Flight information unavailable: {str(e)}"
 
     return {
         "flight_results": flight_data,
         "messages": [
-            AIMessage(content="Flight results fetched.")
+            AIMessage(
+                content="Flight recommendations generated"
+            )
         ],
         "llm_calls": state.get("llm_calls", 0) + 1
     }
+
+
 
 
 
@@ -106,9 +168,8 @@ def flight_agent(state: TravelState):
 
 def hotel_agent(state: TravelState):
     query = f"Best hotels for {state['user_query']}"
-    hotel_results = tavily_search(query)
-    # Truncate to 1500 chars to reduce payload
-    hotel_results = truncate_results(hotel_results, max_chars=1500)
+    # hotel_results = tavily_search(query)
+    hotel_results = asyncio.run(tavily_mcp_search(query))
 
     return {
         "hotel_results": hotel_results,
@@ -122,22 +183,64 @@ def hotel_agent(state: TravelState):
 
 
 # =========================
+# Weather Agent
+# =========================
+
+def weather_agent(state: TravelState):
+
+    city = extract_destination(state["user_query"])
+
+    weather_data = asyncio.run(
+        weather_mcp_search(city)
+    )
+
+    forecast_data = asyncio.run(
+        forecast_mcp_search(city)
+    )
+
+    return {
+        "weather_results": f"""
+        Current Weather:
+        {weather_data}
+
+        Forecast:
+        {forecast_data}
+        """,
+        "messages": [
+            AIMessage(
+                content="Weather information fetched"
+            )
+        ]
+    }
+
+
+
+
+# =========================
 # Itinerary Agent
 # =========================
 
 def itinerary_agent(state: TravelState):
-    prompt = f"""Create a travel itinerary based on:
+    prompt = f"""
+Create a complete travel itinerary.
 
-Trip: {state['user_query']}
+User Query:
+{state['user_query']}
 
-Flight info: {state['flight_results'][:800] if state['flight_results'] else 'N/A'}
+Flight Results:
+{state['flight_results']}
 
-Hotel info: {state['hotel_results'][:800] if state['hotel_results'] else 'N/A'}
+Hotel Results:
+{state['hotel_results']}
 
-Provide practical, budget-aware itinerary."""
+Weather Results:
+{state['weather_results']}
+
+Make the itinerary practical, budget-aware, and easy to follow.
+"""
 
     response = llm.invoke([
-        SystemMessage(content="Expert travel planner. Be concise."),
+        SystemMessage(content="You are an expert travel planner."),
         HumanMessage(content=prompt)
     ])
 
@@ -154,20 +257,44 @@ Provide practical, budget-aware itinerary."""
 # =========================
 
 def final_agent(state: TravelState):
-    final_prompt = f"""Generate final travel response.
+    final_prompt = f"""
+Generate the final travel response for the user.
 
-Trip: {state['user_query']}
+User Request:
+{state['user_query']}
 
-Flights: {state['flight_results'][:600] if state['flight_results'] else 'N/A'}
+Flights:
+{state['flight_results']}
 
-Hotels: {state['hotel_results'][:600] if state['hotel_results'] else 'N/A'}
+Hotels:
+{state['hotel_results']}
 
-Itinerary: {state['itinerary'][:1000] if state['itinerary'] else 'N/A'}
+Weather:
+{state['weather_results']}
 
-Format with: Trip Summary, Flights, Hotels, Daily Schedule, Budget, Tips."""
+Itinerary:
+{state['itinerary']}
+
+Format the final answer beautifully using these sections:
+
+1. Trip Summary
+2. Flight Information
+3. Hotel Suggestions
+4. Weather Information
+5. Day-by-Day Itinerary
+6. Estimated Budget
+7. Final Recommendations
+
+
+Important:
+- Be clear and practical.
+- Mention that live flight API may not provide ticket prices if pricing is unavailable.
+- Include weather-based travel advice.
+- Keep the response useful for real travel planning.
+"""
 
     response = llm.invoke([
-        SystemMessage(content="Professional travel assistant. Be clear and concise."),
+        SystemMessage(content="You are a professional AI travel booking assistant."),
         HumanMessage(content=final_prompt)
     ])
 
@@ -185,12 +312,14 @@ graph = StateGraph(TravelState)
 
 graph.add_node("flight_agent", flight_agent)
 graph.add_node("hotel_agent", hotel_agent)
+graph.add_node("weather_agent", weather_agent)
 graph.add_node("itinerary_agent", itinerary_agent)
 graph.add_node("final_agent", final_agent)
 
 graph.add_edge(START, "flight_agent")
 graph.add_edge("flight_agent", "hotel_agent")
-graph.add_edge("hotel_agent", "itinerary_agent")
+graph.add_edge("hotel_agent", "weather_agent")
+graph.add_edge("weather_agent", "itinerary_agent")
 graph.add_edge("itinerary_agent", "final_agent")
 graph.add_edge("final_agent", END)
 
@@ -235,6 +364,7 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
             "user_query": user_input,
             "flight_results": "",
             "hotel_results": "",
+            "weather_results": "",
             "itinerary": "",
             "llm_calls": 0
         },
@@ -248,6 +378,7 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
         "answer": final_answer,
         "flight_results": result.get("flight_results", ""),
         "hotel_results": result.get("hotel_results", ""),
+        "weather_results": result.get("weather_results", ""),
         "itinerary": result.get("itinerary", ""),
         "llm_calls": result.get("llm_calls", 0),
     }
