@@ -1,127 +1,157 @@
-# ✈️ TripMate AI — A Multi-Agent Travel Planner with LangGraph
+<div align="center">
 
-An open-source AI travel planner that turns a natural-language trip request into a practical travel plan with flight suggestions, hotel ideas, and a day-by-day itinerary. The project uses a multi-agent workflow built with LangGraph, LangChain, and FastAPI.
+# ✈️ TripMate AI: MCP Edition
 
-## Why this project?
+### A multi-agent travel planner whose agents use their tools through the Model Context Protocol
 
-Planning a trip usually means jumping between multiple websites, tools, and spreadsheets. This project brings that flow into one experience by combining:
+*Describe a trip in one sentence and get flights, hotels, live weather and a day-by-day itinerary.<br/>
+Each data source is an MCP server: one remote, one launched through `uvx`, and one built for this project.*
 
-- a flight-search agent,
-- a hotel-research agent,
-- an itinerary-planning agent, and
-- a final response agent,
+<br/>
 
-all coordinated through a LangGraph workflow.
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![LangGraph](https://img.shields.io/badge/LangGraph-1.2-1C3C3C)
+![MCP](https://img.shields.io/badge/MCP-3%20servers-7C3AED)
+![FastMCP](https://img.shields.io/badge/FastMCP-custom%20server-7C3AED)
+![Groq](https://img.shields.io/badge/Groq-gpt--oss--20b-F55036)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-checkpointer-4169E1?logo=postgresql&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-backend-009688?logo=fastapi&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)
 
-## Features
+</div>
 
-- ✈️ Flight research using AviationStack
-- 🏨 Hotel suggestions using Tavily search
-- 🧠 Multi-agent orchestration with LangGraph
-- 📝 Structured travel itinerary generation
-- 🌐 FastAPI backend with a simple web interface
-- 💾 Conversation state persistence using PostgreSQL
-- ⚡ LLM-powered responses with Groq
+---
 
-## Tech Stack
+## 💡 Why this project
 
-- Python 3.10+
-- FastAPI
-- Jinja2 + HTML/CSS/JavaScript frontend
-- LangGraph
-- LangChain
-- Groq LLMs
-- PostgreSQL
-- Tavily API
-- AviationStack API
+Planning a trip means jumping between flight sites, hotel searches, weather apps and a notes file. TripMate AI does it with **five specialised agents** in a LangGraph pipeline.
 
-## Project Structure
+The interesting part is **how the agents reach the outside world**. Instead of hard-coding API clients, every external capability is an **MCP server** loaded through `langchain-mcp-adapters`. You can add, swap or remove a data source in config, without editing agent code.
 
-```text
-.
-├── app.py                # FastAPI app entry point
-├── backend.py            # LangGraph travel workflow
-├── requirements.txt      # Python dependencies
-├── static/               # Static frontend assets
-├── templates/            # HTML templates
-└── tools/                # Flight and web search integrations
+> 🔁 **This is v2.** [`Multi-Agent-With-LangGraphs-LangSmith`](https://github.com/nishantrv/Multi-Agent-With-LangGraphs-LangSmith) is v1, which uses hand-written Python tools. Comparing the two shows the move from bespoke tool code to the MCP standard.
+
+---
+
+## 🧭 Architecture
+
+```mermaid
+flowchart LR
+    U([👤 Traveller]) --> API[FastAPI<br/>POST /api/travel]
+    API --> G
+
+    subgraph G[LangGraph StateGraph · PostgresSaver checkpointer]
+        direction LR
+        F[✈️ Flight agent] --> H[🏨 Hotel agent] --> W[🌦️ Weather agent] --> I[🗺️ Itinerary agent] --> Z[📝 Final agent]
+    end
+
+    F -. list_airports / list_airlines .-> AV[(AviationStack MCP<br/>stdio · uvx)]
+    H -. tavily_search .-> TV[(Tavily MCP<br/>remote · streamable HTTP)]
+    W -. get_current_weather / get_forecast .-> WX[(Custom Weather MCP<br/>stdio · FastMCP + OpenWeather)]
+
+    Z --> API --> U
 ```
 
-## Prerequisites
+| Agent | What it does |
+|---|---|
+| ✈️ **Flight** | Pulls airports and airlines from the AviationStack MCP and asks the LLM for likely routes, carriers, duration, fare range and booking advice |
+| 🏨 **Hotel** | Runs a Tavily web search over MCP for accommodation that matches the request |
+| 🌦️ **Weather** | Uses the LLM to extract the destination, then calls the **custom FastMCP server** for current conditions and a 5-step forecast |
+| 🗺️ **Itinerary** | Combines flights, hotels and weather into a practical, budget-aware plan |
+| 📝 **Final** | Writes the answer in seven sections: summary, flights, hotels, weather, day-by-day plan, budget and recommendations |
 
-Before running the project locally, make sure you have:
+---
 
-- Python 3.10 or newer installed
-- PostgreSQL running and accessible
-- API keys for:
-  - Groq
-  - Tavily
-  - AviationStack
+## 🔌 Three MCP transports in one app
 
-## Environment Variables
+| Server | Transport | How it runs |
+|---|---|---|
+| **Tavily** | `streamable_http` | Hosted remote MCP at `mcp.tavily.com` |
+| **AviationStack** | `stdio` | Third-party package launched on demand with `uvx aviationstack-mcp` |
+| **Weather** | `stdio` | **Built for this project.** `custom_weather_mcp_server.py` is a `FastMCP` server that wraps OpenWeather. It starts with the same Python interpreter as the app. |
 
-Create a .env file in the project root with the following variables:
+Design details in `mcp_client.py`:
+- **Each server is loaded lazily and separately.** If AviationStack is down, hotel search still works.
+- **Tool handles are cached** after the first load, so each request doesn't reconnect.
+- **Error messages are specific.** A missing tool error lists the tools that *are* available, which makes debugging fast.
 
-```env
-DATABASE_URL=postgresql://user:password@localhost:5432/travel_db
-GROQ_API_KEY=your_groq_api_key
-AVIATIONSTACK_API_KEY=your_aviationstack_api_key
-TAVILY_API_KEY=your_tavily_api_key
-DEFAULT_ORIGIN_IATA=DAC
-```
+---
 
-## Installation
+## 🧠 Conversation memory
+
+The graph is compiled with LangGraph's **`PostgresSaver`**, so each `thread_id` keeps its state across requests and server restarts. The API returns the `thread_id` so the client can continue the same conversation. SSL is enforced automatically (`sslmode=require`), which suits managed Postgres such as Render.
+
+---
+
+## 🚀 Quickstart
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate   # On Windows: .venv\Scripts\activate
+git clone https://github.com/nishantrv/MulitAgent-With-MCPs.git
+cd MulitAgent-With-MCPs
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pip install uv                                         # provides `uvx` for the AviationStack MCP server
 ```
 
-## Running the App
+Create a `.env` file:
 
-Start the FastAPI server:
+```ini
+GROQ_API_KEY=...
+TAVILY_API_KEY=...
+AVIATIONSTACK_API_KEY=...
+OPENWEATHER_API_KEY=...
+DATABASE_URL=postgresql://user:password@host:5432/travel_db
+```
 
 ```bash
-python app.py
+python app.py                 # → http://127.0.0.1:8000
+python test.py                # check which MCP servers connect and list their tools
 ```
 
-Then open your browser at:
+**With Docker:**
 
-```text
-http://127.0.0.1:8000/
+```bash
+docker build -t tripmate-mcp .
+docker run --env-file .env -p 8000:8000 tripmate-mcp
 ```
 
-## API Endpoints
+### API
 
-- GET /health - Health check
-- POST /api/travel - Submit a travel request
-
-Example request:
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/` | Web UI |
+| `POST` | `/api/travel` | `{"message": "...", "thread_id": "optional"}` returns answer, flights, hotels, itinerary, `llm_calls` and `thread_id` |
+| `GET` | `/health` | Liveness check |
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/travel \
   -H "Content-Type: application/json" \
-  -d '{"message":"Plan a 3-day trip to Tokyo with a budget of $1200"}'
+  -d '{"message":"Plan a 4-day trip from Dublin to Tokyo in October on a $2000 budget"}'
 ```
 
-## How the Workflow Works
+---
 
-1. The user submits a travel request.
-2. The flight agent gathers flight-related information.
-3. The hotel agent searches for accommodation suggestions.
-4. The itinerary agent creates a practical travel plan.
-5. The final agent formats the result into a polished response.
+## 🗂️ Project layout
 
-## Contributing
+```
+app.py                        FastAPI app + UI routes
+backend.py                    LangGraph state, five agents, Postgres checkpointer
+mcp_client.py                 MultiServerMCPClient: Tavily · AviationStack · Weather
+custom_weather_mcp_server.py  FastMCP server wrapping OpenWeather
+templates/ · static/          Web UI (HTML / CSS / JS)
+test.py · mcp_client_test.py  MCP connectivity checks
+Dockerfile
+```
 
-Contributions are welcome. If you want to improve the app, add new travel features, or fix issues:
+---
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Open a pull request
+## 🧰 Tech stack
 
-## Acknowledgments
+**LangGraph** · **LangChain** · **langchain-mcp-adapters** · **MCP / FastMCP** · **Groq** (`openai/gpt-oss-20b`) · **PostgreSQL** (`langgraph-checkpoint-postgres`) · **FastAPI** · **Jinja2** · **Tavily** · **AviationStack** · **OpenWeather** · **Docker**
 
-This project is built with the help of modern LLM tooling and travel APIs, and it is intended as a practical example of combining LangGraph agents with real-world applications.
+---
+
+<div align="center">
+
+Built by **[Nishant](https://github.com/nishantrv)**. If this was useful, a ⭐ is appreciated.
+
+</div>
