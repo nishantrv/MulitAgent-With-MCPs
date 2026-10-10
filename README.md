@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **This repository has moved.** TripMate AI now lives in one repo, [`nishantrv/TripMate-AI`](https://github.com/nishantrv/TripMate-AI), with each version on its own branch.
+> This repo is **v2**, now on the [`v2-mcp`](https://github.com/nishantrv/TripMate-AI/tree/v2-mcp) branch. This copy is archived and read-only.
+
 <div align="center">
 
 # ✈️ TripMate AI: MCP Edition
